@@ -1,0 +1,44 @@
+{:mvn/repos
+ {"central"
+  {:url "https://repo1.maven.org/maven2/"}
+  "clojars"
+  {:url "https://repo.clojars.org/"}
+  "cognitect-dev-tools"
+  {:url "https://dev-tools.cognitect.com/maven/releases/"}}
+
+ :paths ["src" "resources" "config"]
+
+ :aliases
+
+ {:build ; clj -T:build uber
+  {:deps {io.github.clojure/tools.build {:tag "v0.8.4"
+                                         :sha "8c3cd69"}}
+   :ns-default build}
+
+  :main-dev
+  {:extra-deps {cider/cider-nrepl {:mvn/version,"0.28.5"}
+                io.github.clojure/tools.build {:tag "v0.8.4"
+                                               :sha "8c3cd69"}}
+   :jvm-opts ["-Xmx256m"]
+   :main-opts ["-e" "(do  (require 'clinvar-gk-pilot.main))"
+               "-m" "nrepl.cmdline"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}}
+
+ :deps
+ {org.clojure/clojure {:mvn/version "1.11.1"}
+  org.clojure/core.async {:mvn/version "1.6.673"}
+  com.taoensso/timbre {:mvn/version "6.1.0"}
+
+  ;; fast JSON/CSV
+  com.cnuernber/charred {:mvn/version "1.028"}
+  hato/hato {:mvn/version "0.9.0"}
+
+  ;;com.google.cloud/google-cloud-storage {:mvn/version "2.6.1"}
+
+  digest/digest  {:mvn/version "1.4.10"}
+  nrepl/nrepl  {:mvn/version "0.9.0"}
+  ;; alternative to REBL
+  djblue/portal  {:mvn/version "0.23.0"}
+  org.rocksdb/rocksdbjni {:mvn/version "8.1.1.1"}
+  mount/mount  {:mvn/version "0.1.16"}
+  org.clj-commons/claypoole {:mvn/version "1.2.2"}}}

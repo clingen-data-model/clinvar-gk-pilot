@@ -1,0 +1,11 @@
+{:linters
+ {:non-arg-vec-return-type-hint {:level :off}
+  :unused-binding {:level :off}
+  :unresolved-symbol
+  {:exclude [(taoensso.nippy/extend-thaw [data-input])
+             (taoensso.nippy/extend-freeze [x data-output])
+             (genegraph.source.graphql.common.secure/def-role-controlled-resolver)
+             (genegraph.database.query/declare-query)]}}
+ :lint-as {mount.core/defstate clojure.core/def
+           genegraph.source.graphql.common.cache/defresolver clojure.core/defn
+           com.climate.claypoole/with-shutdown! clojure.core/let}}
