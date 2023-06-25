@@ -6,7 +6,7 @@
             [com.climate.claypoole :as cp]
             [taoensso.timbre :as log]))
 
-(log/set-level! :info)
+(log/set-min-level! :info)
 
 ;; (defn log [& vals]
 ;;   (assert (= 0 (rem (count vals) 2)) "Must provide even number of vals")
@@ -75,6 +75,7 @@
                 (seq (-> body :warnings)))
           (add-error record {:fn ::normalize-copy-number-count
                              :hgvs_expr hgvs-expr
+                             :baseline_copies absolute-copies
                              :opts opts
                              :response resp})
           (-> body (get "copy_number_count"))))
@@ -82,7 +83,66 @@
       ;; Is a copy number count with a single count,
       ;; but doesn't have the necessary info in the record to normalize it
       :else
-      ())))
+      {:errors ["Record looked like CopyNumberCount but was missing necessary information"]})))
+
+(defn clinvar-copy-class-to-EFO
+  "Returns an EFO CURIE for a copy class str.
+   Uses lower-case 'efo' prefix"
+  [copy-class-str]
+  ({"Deletion"         "efo:0030067"
+    "copy number loss" "efo:0030067"
+
+    "Duplication"      "efo:0030070"
+    "copy number gain" "efo:0030070"}
+   copy-class-str))
+
+(defn normalize-copy-number-change
+  "Normalize a copy number change record (ClinVar marked as Dup/Del or copy number gain/loss)"
+  ;; Remaining copy loss/gain, dels/dups (CopyNumberChange): If the variation_type is 'Deletion', 'Duplication', 'copy number loss', or 'copy number gain' then use the hgvs.nucleotide expression to call the hgvs_to_copy_number_change API. If the hgvs.nucleotide value is null then use the seq.derived_hgvs if it is not null .
+  [record {:keys [normalizer-url] :as opts}]
+  (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])
+        derived-hgvs (get-in record ["derived_hgvs"])
+        efo-copy-class (clinvar-copy-class-to-EFO
+                        (get-in record ["variation_type"]))
+        hgvs-expr (or hgvs-nucleotide derived-hgvs) ;; "NC_000010.11:g.110589642dup"
+        resp (http/get (str normalizer-url "/hgvs_to_copy_number_change")
+                       {:http-client http-client
+                        :throw-exceptions false
+                        :query-params {"hgvs_expr" hgvs-expr
+                                       "copy_change" efo-copy-class}})
+        body (some-> resp :body charred/read-json)]
+    (if (or (not= 200 (:status resp))
+            (seq (-> body :errors))
+            (seq (-> body :warnings)))
+      (add-error record {:fn ::normalize-copy-number-change
+                         :hgvs_expr hgvs-expr
+                         :copy_change efo-copy-class
+                         :opts opts
+                         :response resp})
+      (-> body (get "copy_number_change")))))
+
+(defn normalize-hgvs-allele
+  "Normalize hgvs that doesn't meet prior clauses, using /to_vrs endpoint.
+   May consider switching to /translate_from."
+  [record {:keys [normalizer-url] :as opts}]
+  (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])
+        resp (http/get (str normalizer-url "/to_vrs")
+                       {:http-client http-client
+                        :throw-exceptions false
+                        :query-params {"q" hgvs-nucleotide}})
+        body (some-> resp :body charred/read-json)]
+    (if (or (not= 200 (:status resp))
+            (seq (-> body :errors))
+            (seq (-> body :warnings)))
+      (add-error record {:fn ::normalize-copy-number-change
+                         :q hgvs-nucleotide
+                         :opts opts
+                         :response resp})
+      (do (when (not= 1 (count (get body "variations")))
+            (log/error :msg "to_vrs did not return exactly 1 variation"
+                       :hgvs-nucleotide hgvs-nucleotide
+                       :resp-body body))
+          (-> body (get "variations") first)))))
 
 (defn normalize-text [record]
   (let [id (get record "id")]
@@ -157,19 +217,19 @@
   (cond
     ;; 1
     (get record "canonical_spdi")
-    (do (log/info :case 1)
+    (do (log/debug :case 1)
         (normalize-spdi record opts))
 
     ;; 2
     (#{"Genotype" "Haplotype"} (get record "subclass_type"))
-    (do (log/info :case 2)
+    (do (log/debug :case 2)
         (normalize-text record))
 
     ;; 3
     ;; Genome NCBI36 only (Text): if at least one of the hgvs.assembly or seq.assembly has the value 'NCBI36' and neither one has 'GRCh37' or 'GRCh38' then use the id (clinvar variation id) as the input to get a VRS Text object for this record.
     (or (= "NCBI36" (get-in record ["seq" "assembly"]))
         (= "NCBI36" (get-in record ["hgvs" "assembly"])))
-    (do (log/info :case 3)
+    (do (log/debug :case 3)
         (normalize-text record))
 
     ;; 4
@@ -177,7 +237,7 @@
     (and (nil? (get-in record ["hgvs" "assembly"]))
          (nil? (get-in record ["seq" "assembly"]))
          (nil? (get-in record ["seq" "accession"])))
-    (do (log/info :case 4)
+    (do (log/debug :case 4)
         (normalize-text record))
 
     ;; 5
@@ -191,34 +251,48 @@
     ;; g. imprecise inner range dup or del or delins or ins '(CM|N[CTW]\_)[0-9]+\.[0-9]+\:[gm]\.\([0-9]+\_\?\)\_\(\?\_[0-9]+\)(dup|del|delins|ins)[ACTG]*$'
     (and (not (nil? (get-in record ["hgvs" "nucleotide"])))
          (not (supported-hgvs? (get-in record ["hgvs" "nucleotide"]))))
-    (do (log/info :case 5)
+    (do (log/debug :case 5)
         (normalize-text record))
 
     ;; 6
     ;; Names ending in 'x[0-9]+' (CopyNumberCount): When the absolute_copies value is not null use the hgvs.nucleotide value if it is available to call the hgvs_to_copy_number_count api. If the hgvs.nucleotide value is null then use the seq.derived_hgvs value if it is available.
     (re-matches #".*x[0-9]$"
                 (get record "name"))
-    (do (log/info :case 6)
+    (do (log/debug :case 6)
         (normalize-copy-number-count record opts))
-
 
     ;; 7
     ;; CNVs with min,max counts (Text): If the min_copies and/or max_copies is not null then use the `'id' to create a Text variation.
+    (or (-> record (get "min_copies") nil? not)
+        (-> record (get "max_copies") nil? not))
+    (do (log/debug :case 7)
+        (normalize-text record))
 
     ;; 8
     ;; Remaining copy loss/gain, dels/dups (CopyNumberChange): If the variation_type is 'Deletion', 'Duplication', 'copy number loss', or 'copy number gain' then use the hgvs.nucleotide expression to call the hgvs_to_copy_number_change API. If the hgvs.nucleotide value is null then use the seq.derived_hgvs if it is not null .
+    (let [variation-type (get record "variation_type")]
+      (contains? #{"Deletion"
+                   "Duplication"
+                   "copy number loss"
+                   "copy number gain"}
+                 variation-type))
+    (do (log/debug :case 8)
+        (normalize-copy-number-change record opts))
 
     ;; 9
     ;; Remaining supported genomic HGVS (Allele): If any remaining records have a value in the hgvs.nucleotide field, then use it to call the to_vrs api.
+    (-> record (get-in ["hgvs" "nucleotide"]) nil? not)
+    (do (log/debug :case 9)
+        (normalize-hgvs-allele record opts))
 
 
     ;; 10
     ;; Insufficient information (Text): all remaining should use the id value to create a Text variation.
     ;; TODO, treat as text but add an annotation for reason
-
     :else
-    (do (log/info :case 10)
-        {:errors ["Unrecognized variation record"]})))
+    (do (log/debug :case 10)
+        (add-error (normalize-text record)
+                   "Unrecognized variation record"))))
 
 (def defaults
   {:normalizer-url "https://normalization.clingen.app/variation"})
@@ -255,8 +329,9 @@
                (->> reader
                     (line-seq)
                     (map charred/read-json)
-                    (filter #(get % "canonical_spdi"))
+                    #_(filter #(get % "canonical_spdi"))
                     #_(#(do (log/info (first %)) %))
-                    (take 10))))
+                    (take (or (-> args :limit)
+                              Long/MAX_VALUE)))))
              (#(doseq [out %]
                  (prn out))))))))
