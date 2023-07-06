@@ -4,50 +4,104 @@
             [hato.client :as http]
             [charred.api :as charred]
             [com.climate.claypoole :as cp]
-            [taoensso.timbre :as log]))
+            [taoensso.timbre :as log])
+  (:import (java.time Instant Duration)))
 
 (log/set-min-level! :info)
-
-;; (defn log [& vals]
-;;   (assert (= 0 (rem (count vals) 2)) "Must provide even number of vals")
-;;   (.write *out* (prn-str (apply hash-map vals))))
 
 (spec/def ::string (spec/and string? seq))
 (spec/def ::filename ::string)
 (spec/def ::args (spec/keys :req-un [::filename]))
 
-(def http-client (http/build-http-client {:version :http-2
-                                          :connect-timeout (* 30 1000)}))
+;; Adding a round-robin http pool doesn't seem to help much, if at all
+(defn build-client []
+  (http/build-http-client {:version :http-2
+                           :connect-timeout (* 30 1000)}))
+(def http-client-pool (mapv (fn [_] (atom build-client))
+                            (range 20)))
+(def http-client-pool-pointer (atom 0))
+(defn get-http-client
+  "Returns http clients from the pool round-robin"
+  []
+  (let [idx (swap! http-client-pool-pointer
+                   (fn [v] (let [newv (inc v)]
+                             ;; check overflow
+                             (if (>= newv (count http-client-pool)) 0 newv))))]
+    (nth http-client-pool idx)))
+
+(defn http-get [url params]
+  (loop []
+    (let [client (get-http-client)
+          goaway? (atom false)
+          resp (try (http/get url
+                              {:http-client @client
+                               :throw-exceptions false
+                               :query-params params})
+                    (catch java.io.IOException e
+                      (let [msg (.getMessage e)]
+                        (when (some-> msg #(.contains "GOAWAY"))
+                          (reset! goaway? true))
+                        nil)))]
+      ;; HTTP2 GOAWAY response results in IOException in the Java http client.
+      ;; the hato :throw-exceptions false doesn't disable this.
+      ;; So we need to check for 502, and for IOExceptions that are GOAWAY, and
+      ;; treat them the same.
+      (if (or @goaway? (= 502 (:status resp)))
+        (do (log/warn :fn :http-get :url url :params params
+                      :status (:status resp) :goaway @goaway?
+                      :msg "Received temporary server error, trying again")
+            ;; Construct a new client to re-establish connection
+            ;; ... actually it seems like the hato (or java) client does this automatically
+            #_(reset! client (build-client))
+            (Thread/sleep 500)
+            (recur))
+        resp))))
 
 (defn add-error
   "Adds some error object to ctx under :errors"
   [ctx error]
   (update ctx :errors (fn [errors]
-                        (concat [] errors [error]))))
+                        (into [] (concat [] errors [error])))))
+
+(defn add-errors
+  "Adds multiple error objects to ctx under :errors"
+  [ctx errors]
+  (reduce (fn [agg e] (add-error agg e)) ctx errors))
+
+(defn validate-response
+  "Takes a ring/clj-http/hato style HTTP Response map.
+   Checks if status code is 200, and response is parseable JSON, and has no errors or warnings"
+  [resp]
+  (let [error-templ {:fn ::validate-response
+                     :status (:status resp)
+                     :body (:body resp)}]
+    (if (not= 200 (:status resp))
+      (add-error {} (assoc error-templ :msg "Not status 200"))
+      (try (let [body (some-> resp :body charred/read-json)]
+             (if (or (seq (get body "errors"))
+                     (seq (get body "warnings")))
+               (add-error {} (assoc error-templ
+                                    :msg "Error returned from variation normalizer"
+                                    :response-errors (concat (get body "errors")
+                                                             (get body "warnings"))))
+               {:body body}))
+           (catch Exception e (add-error {} (.getMessage e)))))))
 
 (defn normalize-spdi
   "Returns normalized form of variant.
 
-   If return value has some :errors, it didn't work"
-  [variant {:keys [normalizer-url] :as opts}]
-  (let [spdi (get variant "canonical_spdi")
-        resp (http/get (str normalizer-url "/to_canonical_variation")
-                       {:http-client http-client
-                        :throw-exceptions false
-                        :query-params {"q" spdi
-                                       "fmt" "spdi"
-                                       "untranslatable_returns_text" false}})
-        body (some-> resp :body charred/read-json)]
-    (if (or (not= 200 (:status resp))
-            (seq (-> body :errors))
-            (seq (-> body :warnings)))
-      (add-error variant {:fn ::norm-spdi
-                          :spdi spdi
-                          :opts opts
-                          :response resp})
-      (-> body
-          (get "canonical_variation")
-          (get "canonical_context")))))
+   If return value has some :errors, it didn't work
+
+   TODO: will be switching from /to_canonical_variation to /translate_from when API is updated."
+  [record {:keys [normalizer-url] :as opts}]
+  (let [spdi (get record "canonical_spdi")
+        resp (http-get (str normalizer-url "/to_canonical_variation")
+                       {"q" spdi
+                        "fmt" "spdi"})
+        {errors :errors body :body} (validate-response resp)]
+    (if (seq errors)
+      (add-errors record errors)
+      (get-in body ["canonical_variation" "canonical_context"]))))
 
 (defn normalize-copy-number-count
   "Normalize a copy number count record (ClinVar variant name ends in x[0-9]+)"
@@ -64,26 +118,20 @@
            (or (not (nil? hgvs-nucleotide))
                (not (nil? seq-derived-hgvs))))
       (let [hgvs-expr (or hgvs-nucleotide seq-derived-hgvs)
-            resp (http/get (str normalizer-url "/hgvs_to_copy_number_count")
-                           {:http-client http-client
-                            :throw-exceptions false
-                            :query-params {"hgvs_expr" hgvs-expr
-                                           "baseline_copies" absolute-copies}})
-            body (some-> resp :body charred/read-json)]
-        (if (or (not= 200 (:status resp))
-                (seq (-> body :errors))
-                (seq (-> body :warnings)))
-          (add-error record {:fn ::normalize-copy-number-count
-                             :hgvs_expr hgvs-expr
-                             :baseline_copies absolute-copies
-                             :opts opts
-                             :response resp})
+            resp (http-get (str normalizer-url "/hgvs_to_copy_number_count")
+                           {"hgvs_expr" hgvs-expr
+                            "baseline_copies" absolute-copies})
+            {errors :errors body :body} (validate-response resp)]
+        (if (seq errors)
+          (add-errors record errors)
           (-> body (get "copy_number_count"))))
 
       ;; Is a copy number count with a single count,
       ;; but doesn't have the necessary info in the record to normalize it
       :else
       {:errors ["Record looked like CopyNumberCount but was missing necessary information"]})))
+
+
 
 (defn clinvar-copy-class-to-EFO
   "Returns an EFO CURIE for a copy class str.
@@ -105,20 +153,12 @@
         efo-copy-class (clinvar-copy-class-to-EFO
                         (get-in record ["variation_type"]))
         hgvs-expr (or hgvs-nucleotide derived-hgvs) ;; "NC_000010.11:g.110589642dup"
-        resp (http/get (str normalizer-url "/hgvs_to_copy_number_change")
-                       {:http-client http-client
-                        :throw-exceptions false
-                        :query-params {"hgvs_expr" hgvs-expr
-                                       "copy_change" efo-copy-class}})
-        body (some-> resp :body charred/read-json)]
-    (if (or (not= 200 (:status resp))
-            (seq (-> body :errors))
-            (seq (-> body :warnings)))
-      (add-error record {:fn ::normalize-copy-number-change
-                         :hgvs_expr hgvs-expr
-                         :copy_change efo-copy-class
-                         :opts opts
-                         :response resp})
+        resp (http-get (str normalizer-url "/hgvs_to_copy_number_change")
+                       {"hgvs_expr" hgvs-expr
+                        "copy_change" efo-copy-class})
+        {errors :errors body :body} (validate-response resp)]
+    (if (seq errors)
+      (add-errors record errors)
       (-> body (get "copy_number_change")))))
 
 (defn normalize-hgvs-allele
@@ -126,18 +166,11 @@
    May consider switching to /translate_from."
   [record {:keys [normalizer-url] :as opts}]
   (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])
-        resp (http/get (str normalizer-url "/to_vrs")
-                       {:http-client http-client
-                        :throw-exceptions false
-                        :query-params {"q" hgvs-nucleotide}})
-        body (some-> resp :body charred/read-json)]
-    (if (or (not= 200 (:status resp))
-            (seq (-> body :errors))
-            (seq (-> body :warnings)))
-      (add-error record {:fn ::normalize-copy-number-change
-                         :q hgvs-nucleotide
-                         :opts opts
-                         :response resp})
+        resp (http-get (str normalizer-url "/to_vrs")
+                       {"q" hgvs-nucleotide})
+        {errors :errors body :body} (validate-response resp)]
+    (if (seq errors)
+      (add-errors record errors)
       (do (when (not= 1 (count (get body "variations")))
             (log/error :msg "to_vrs did not return exactly 1 variation"
                        :hgvs-nucleotide hgvs-nucleotide
@@ -147,7 +180,7 @@
 (defn normalize-text [record]
   (let [id (get record "id")]
     (if (nil? id)
-      {:errors "Record had no id"}
+      (add-error record "Record had no id")
       {"id" (str "Text:clinvar:" (get record "id"))
        "type" "Text"
        "definition" (str "clinvar:" (get record "id"))})))
@@ -285,7 +318,6 @@
     (do (log/debug :case 9)
         (normalize-hgvs-allele record opts))
 
-
     ;; 10
     ;; Insufficient information (Text): all remaining should use the id value to create a Text variation.
     ;; TODO, treat as text but add an annotation for reason
@@ -317,21 +349,86 @@
 
 (def keep-running-atom (atom true))
 
+(defn flatten1 [inputs]
+  (for [a inputs b a] b))
+
 (defn -main [& args]
   (let [args (parse-args args)
         _ (log/info :args args)]
-    (cp/with-shutdown! [threadpool (cp/threadpool 10)]
-      (with-open [reader (io/reader (:filename args))]
-        (->> (doall
-              (cp/upmap
-               threadpool
-               #(normalize-record % args)
-               (->> reader
-                    (line-seq)
-                    (map charred/read-json)
-                    #_(filter #(get % "canonical_spdi"))
-                    #_(#(do (log/info (first %)) %))
-                    (take (or (-> args :limit)
-                              Long/MAX_VALUE)))))
-             (#(doseq [out %]
-                 (prn out))))))))
+    ;; Might be able a 502 error backoff by messing around with dynamically changing the pool
+    ;; size at runtime. cp/threadpool returns a
+    ;; java.util.concurrent.ScheduledThreadPoolExecutor (java.util.concurrent.ThreadPoolExecutor)
+    ;; setCorePoolSize will gracefully change pool size.
+    ;; The problem is with upmap we can't add a task back to the queue
+    ;; I could refactor this to use a lazyseq over a channel as the input to upmap,
+    ;; and then inputs resulting in 502 could be re-added to the channel
+    (cp/with-shutdown! [threadpool (cp/threadpool 12)]
+      (with-open [reader (io/reader (:filename args))
+                  writer (io/writer (str "output-" (:filename args)))]
+        (doseq [[in out] (cp/upmap
+                          threadpool
+                          #(let [start (Instant/now)
+                                 out (vector % (normalize-record % args))
+                                 duration (Duration/between start (Instant/now))
+                                 log-threshold 500]
+                             (when (< log-threshold (.toMillis duration))
+                               (log/warn :msg (format "Request took longer than %d ms" log-threshold)
+                                         :duration-ms (.toMillis duration)
+                                         :record %))
+                             out)
+                          (->> (line-seq reader)
+                               (map charred/read-json)
+                               (take (or (-> args :limit) Long/MAX_VALUE))))]
+          (.write writer (charred/write-json-str {:in in :out out}))
+          (.write writer "\n"))))))
+
+
+;; This batched parallelization isn't really helping because
+;; the variation normalizer running in GKS is limited to 4
+;; processor cores, and it is maxing them out already
+#_(defn -main [& args]
+    (let [args (parse-args args)
+          _ (log/info :args args)]
+      (cp/with-shutdown! [threadpool (cp/threadpool 20)]
+        (with-open [reader (io/reader (:filename args))
+                    writer (io/writer (str "output-" (:filename args)))]
+          (doseq [out-batch (cp/upmap
+                             threadpool
+                             (fn [batch] (mapv #(normalize-record % args) batch))
+                             (->> (line-seq reader)
+                                  (map charred/read-json)
+                                  (take (or (-> args :limit) Long/MAX_VALUE))
+                                  (partition-all 20)))]
+            (doseq [out out-batch]
+              (.write writer (charred/write-json-str out))
+              (.write writer "\n")))))))
+
+(comment
+  (let [url "http://127.0.0.1:5001/seqrepo/1/sequence/refseq%3ANM_000551.3"]
+    (cp/with-shutdown! [tp (cp/threadpool 100)]
+      (time (->> (range 100)
+                 (cp/pmap tp
+                          (fn [i] (http-get url {})))
+                 (dorun))))))
+
+
+(comment
+  "perf test"
+  (time (-main :filename "variation_identity_canonical_spdi.ndjson"
+               :normalizer-url "http://localhost:8100/variation"
+               :limit 10000)))
+
+(comment
+  "Main run through whole file in separate thread"
+  (def t (Thread. (fn []
+                    (let [start (Instant/now)]
+                      (dorun (-main :filename "variation_identity.ndjson"
+                                    #_#_:normalizer-url "http://localhost:8100/variation"
+                                    #_#_:limit 100000))
+                      (let [stop (Instant/now)
+                            duration (Duration/between start stop)
+                            millis (.toMillis duration)]
+                        (log/info :msg "Finished run" :millis millis)
+                        (with-open [writer (io/writer "run-time.txt")]
+                          (.write writer (str millis " ms"))))))))
+  (.start t))
