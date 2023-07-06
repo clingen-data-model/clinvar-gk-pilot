@@ -144,6 +144,45 @@
     "copy number gain" "efo:0030070"}
    copy-class-str))
 
+(defn min-or-nil [values]
+  (when (not-empty values)
+    (apply min values)))
+
+(defn max-or-nil [values]
+  (when (not-empty values)
+    (apply max values)))
+
+(defn drop-nils [values]
+  (filter #(not (nil? %)) values))
+
+(defn variation-too-long-to-normalize?
+  "If the variant length exceeds limit, return the length. nil otherwise.
+   Defaults to 1000 as the limit.
+   Uses all start/stop positions in the record to determine the max span."
+  ([record]
+   (variation-too-long-to-normalize? record 1000))
+  ([record limit]
+   (let [lowest-start (->> [(some-> (get-in record ["seq" "disp_start"]) parse-long)
+                            (some-> (get-in record ["seq" "inner_start"]) parse-long)
+                            (some-> (get-in record ["seq" "outer_start"]) parse-long)]
+                           (drop-nils)
+                           (min-or-nil))
+         highest-stop (->> [(some-> (get-in record ["seq" "disp_stop"]) parse-long)
+                            (some-> (get-in record ["seq" "inner_stop"]) parse-long)
+                            (some-> (get-in record ["seq" "outer_stop"]) parse-long)]
+                           (drop-nils)
+                           (max-or-nil))]
+     (when (or (nil? lowest-start)
+               (nil? highest-stop))
+       (log/warn :msg "Record was missing a start or stop"
+                 :record record
+                 :lowest-start lowest-start
+                 :highest-stop highest-stop))
+     (when (and lowest-start
+                highest-stop
+                (< limit (- highest-stop lowest-start)))
+       (- highest-stop lowest-start)))))
+
 (defn normalize-copy-number-change
   "Normalize a copy number change record (ClinVar marked as Dup/Del or copy number gain/loss)"
   ;; Remaining copy loss/gain, dels/dups (CopyNumberChange): If the variation_type is 'Deletion', 'Duplication', 'copy number loss', or 'copy number gain' then use the hgvs.nucleotide expression to call the hgvs_to_copy_number_change API. If the hgvs.nucleotide value is null then use the seq.derived_hgvs if it is not null .
@@ -292,7 +331,12 @@
     (re-matches #".*x[0-9]$"
                 (get record "name"))
     (do (log/debug :case 6)
-        (normalize-copy-number-count record opts))
+        (let [too-long (variation-too-long-to-normalize? record)]
+          (if too-long
+            (add-error (normalize-text record)
+                       (format "Variation record was too long to normalize (%d), treating as text"
+                               too-long))
+            (normalize-copy-number-count record opts))))
 
     ;; 7
     ;; CNVs with min,max counts (Text): If the min_copies and/or max_copies is not null then use the `'id' to create a Text variation.
@@ -310,7 +354,12 @@
                    "copy number gain"}
                  variation-type))
     (do (log/debug :case 8)
-        (normalize-copy-number-change record opts))
+        (let [too-long (variation-too-long-to-normalize? record)]
+          (if too-long
+            (add-error (normalize-text record)
+                       (format "Variation record was too long to normalize (%d), treating as text"
+                               too-long))
+            (normalize-copy-number-change record opts))))
 
     ;; 9
     ;; Remaining supported genomic HGVS (Allele): If any remaining records have a value in the hgvs.nucleotide field, then use it to call the to_vrs api.
