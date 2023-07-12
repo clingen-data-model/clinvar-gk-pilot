@@ -1,13 +1,20 @@
 (ns clinvar-gk-pilot.main
-  (:require [clojure.java.io :as io]
+  (:require [charred.api :as charred]
+            [cheshire.core :as json]
+            [clojure.java.io :as io]
             [clojure.spec.alpha :as spec]
-            [hato.client :as http]
-            [charred.api :as charred]
             [com.climate.claypoole :as cp]
+            [hato.client :as http]
             [taoensso.timbre :as log])
-  (:import (java.time Instant Duration)))
+  (:import (java.time Duration Instant)))
 
 (log/set-min-level! :info)
+(def appender
+  "File appender for timbre."
+  (log/spit-appender
+   {:fname (str "logs/clinvar-gk-pilot.log")}))
+(log/swap-config!
+ #(update % :appenders merge {:file appender}))
 
 (spec/def ::string (spec/and string? seq))
 (spec/def ::filename ::string)
@@ -17,8 +24,8 @@
 (defn build-client []
   (http/build-http-client {:version :http-2
                            :connect-timeout (* 30 1000)}))
-(def http-client-pool (mapv (fn [_] (atom build-client))
-                            (range 20)))
+(def http-client-pool (mapv (fn [_] (atom (build-client)))
+                            (range 10)))
 (def http-client-pool-pointer (atom 0))
 (defn get-http-client
   "Returns http clients from the pool round-robin"
@@ -31,10 +38,11 @@
 
 (defn http-get [url params]
   (loop []
-    (let [client (get-http-client)
+    (let [client-atom (get-http-client)
+          client @client-atom
           goaway? (atom false)
           resp (try (http/get url
-                              {:http-client @client
+                              {:http-client client
                                :throw-exceptions false
                                :query-params params})
                     (catch java.io.IOException e
@@ -51,8 +59,8 @@
                       :status (:status resp) :goaway @goaway?
                       :msg "Received temporary server error, trying again")
             ;; Construct a new client to re-establish connection
-            ;; ... actually it seems like the hato (or java) client does this automatically
-            #_(reset! client (build-client))
+            ;; ... actually it seems like the hato (or java) client does this automatically? (need to verify)
+            (reset! client-atom (build-client))
             (Thread/sleep 500)
             (recur))
         resp))))
@@ -77,7 +85,7 @@
                      :body (:body resp)}]
     (if (not= 200 (:status resp))
       (add-error {} (assoc error-templ :msg "Not status 200"))
-      (try (let [body (some-> resp :body charred/read-json)]
+      (try (let [body (some-> resp :body json/parse-string)]
              (if (or (seq (get body "errors"))
                      (seq (get body "warnings")))
                (add-error {} (assoc error-templ
@@ -411,55 +419,27 @@
     ;; The problem is with upmap we can't add a task back to the queue
     ;; I could refactor this to use a lazyseq over a channel as the input to upmap,
     ;; and then inputs resulting in 502 could be re-added to the channel
-    (cp/with-shutdown! [threadpool (cp/threadpool 12)]
+    (cp/with-shutdown! [threadpool (cp/threadpool 8)]
       (with-open [reader (io/reader (:filename args))
                   writer (io/writer (str "output-" (:filename args)))]
         (doseq [[in out] (cp/upmap
                           threadpool
-                          #(let [start (Instant/now)
-                                 out (vector % (normalize-record % args))
-                                 duration (Duration/between start (Instant/now))
-                                 log-threshold 500]
-                             (when (< log-threshold (.toMillis duration))
-                               (log/warn :msg (format "Request took longer than %d ms" log-threshold)
-                                         :duration-ms (.toMillis duration)
-                                         :record %))
-                             out)
+                          #(do (log/info :msg "Calling normalize-record" :id (get % "id"))
+                               (let [out (try [% (normalize-record % args)]
+                                              (catch Exception e
+                                                (log/error :msg "Exception caught calling normalize-record"
+                                                           :record %
+                                                           :options args
+                                                           :exception e)
+                                                [% nil]))]
+                                 (log/info :msg "Finished normalize-record" :id (get % "id"))
+                                 out))
                           (->> (line-seq reader)
-                               (map charred/read-json)
-                               (take (or (-> args :limit) Long/MAX_VALUE))))]
-          (.write writer (charred/write-json-str {:in in :out out}))
+                               (map json/parse-string)
+                               #_(take (or (-> args :limit) Long/MAX_VALUE))))]
+          (log/info :msg "Writing output" :id (get in "id"))
+          (.write writer (json/generate-string {:in in :out out}))
           (.write writer "\n"))))))
-
-
-;; This batched parallelization isn't really helping because
-;; the variation normalizer running in GKS is limited to 4
-;; processor cores, and it is maxing them out already
-#_(defn -main [& args]
-    (let [args (parse-args args)
-          _ (log/info :args args)]
-      (cp/with-shutdown! [threadpool (cp/threadpool 20)]
-        (with-open [reader (io/reader (:filename args))
-                    writer (io/writer (str "output-" (:filename args)))]
-          (doseq [out-batch (cp/upmap
-                             threadpool
-                             (fn [batch] (mapv #(normalize-record % args) batch))
-                             (->> (line-seq reader)
-                                  (map charred/read-json)
-                                  (take (or (-> args :limit) Long/MAX_VALUE))
-                                  (partition-all 20)))]
-            (doseq [out out-batch]
-              (.write writer (charred/write-json-str out))
-              (.write writer "\n")))))))
-
-(comment
-  (let [url "http://127.0.0.1:5001/seqrepo/1/sequence/refseq%3ANM_000551.3"]
-    (cp/with-shutdown! [tp (cp/threadpool 100)]
-      (time (->> (range 100)
-                 (cp/pmap tp
-                          (fn [i] (http-get url {})))
-                 (dorun))))))
-
 
 (comment
   "perf test"
@@ -471,9 +451,9 @@
   "Main run through whole file in separate thread"
   (def t (Thread. (fn []
                     (let [start (Instant/now)]
-                      (dorun (-main :filename "variation_identity.ndjson"
-                                    #_#_:normalizer-url "http://localhost:8100/variation"
-                                    #_#_:limit 100000))
+                      (-main :filename "variation_identity.ndjson"
+                             #_#_:normalizer-url "http://localhost:8100/variation"
+                             #_#_:limit 100000)
                       (let [stop (Instant/now)
                             duration (Duration/between start stop)
                             millis (.toMillis duration)]
