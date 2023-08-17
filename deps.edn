@@ -22,11 +22,22 @@
    :jvm-opts ["-Xmx256m"]
    :main-opts ["-e" "(do  (require 'clinvar-gk-pilot.main))"
                "-m" "nrepl.cmdline"
+               "--port" "6000"
                "--middleware" "[cider.nrepl/cider-middleware]"]}
 
   :lib-python
   {:jvm-opts ["-Xmx256m" "--add-modules" "jdk.incubator.foreign,jdk.incubator.vector"
-                         "--enable-native-access=ALL-UNNAMED"]}}
+              "--enable-native-access=ALL-UNNAMED"]}
+
+  :repl-client
+  {:extra-deps {cider/cider-nrepl {:mvn/version,"0.28.5"}
+                io.github.clojure/tools.build {:tag "v0.8.4"
+                                               :sha "8c3cd69"}}
+   :jvm-opts ["-Xmx256m"]
+   :main-opts ["-m" "nrepl.cmdline"
+               "--connect"
+               "--port" "6000"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}}
 
  :deps
  {org.clojure/clojure {:mvn/version "1.11.1"}
@@ -35,9 +46,8 @@
 
   ;; fast JSON/CSV
   com.cnuernber/charred {:mvn/version "1.028"}
-  hato/hato {:mvn/version "0.9.0"}
   cheshire/cheshire {:mvn/version "5.11.0"}
-
+  hato/hato {:mvn/version "0.9.0"}
   ;;com.google.cloud/google-cloud-storage {:mvn/version "2.6.1"}
 
   digest/digest  {:mvn/version "1.4.10"}
