@@ -289,9 +289,21 @@
         (check #'hgvs-imprecise-inner-dupdel-delins-ins? expr))))
 
 
+(defn annotate-record [record opts]
+  )
+
+(defn normalize-record-via-xform-plan [record opts]
+  (let [plan-type (get-in record ["vrs_xform_plan" "type"])]
+    )
+)
+
+(defn normalize-and-annotate-record [record opts]
+  (-> (normalize-record-via-xform-plan record opts)
+      annotate-record))
+
 (defn normalize-record
   "Try to normalize a variant record.
-
+  
    If return value has some :errors, it didn't work"
   [record opts]
   (cond
@@ -461,3 +473,16 @@
                         (with-open [writer (io/writer "run-time.txt")]
                           (.write writer (str millis " ms"))))))))
   (.start t))
+
+(defn localrun []
+  "Run in a local testing environment on the main thread"
+  (let [args [:filename "variation_identity.ndjson"
+              :normalizer-url "http://localhost:8002/variation"
+              :limit 10]
+        argm (parse-args args)]
+    (with-open [reader (io/reader (:filename argm))]
+      (doseq [in (->> (line-seq reader)
+                      (map json/parse-string))]
+        (let [out (normalize-record in argm)]
+          (println (json/generate-string {:in in :out out} {:pretty true})))))))
+
