@@ -168,7 +168,7 @@
    Defaults to 1000 as the limit.
    Uses all start/stop positions in the record to determine the max span."
   ([record]
-   (variation-too-long-to-normalize? record 1000))
+   (variation-too-long-to-normalize? record 100000))
   ([record limit]
    (let [lowest-start (->> [(some-> (get-in record ["seq" "disp_start"]) parse-long)
                             (some-> (get-in record ["seq" "inner_start"]) parse-long)
