@@ -5,7 +5,8 @@
             [clojure.spec.alpha :as spec]
             [com.climate.claypoole :as cp]
             [hato.client :as http]
-            [taoensso.timbre :as log])
+            [taoensso.timbre :as log]
+            [clinvar-gk-pilot.vrs-python :as vrs-python])
   (:import (java.time Duration Instant)))
 
 (log/set-min-level! :info)
@@ -97,16 +98,24 @@
 
 (defn normalize-spdi
   "Returns normalized form of variant.
-   If return value has some :errors, it didn't work"
+
+   If return value has some :errors, it didn't work
+
+   TODO: will be switching from /to_canonical_variation to /translate_from when API is updated."
   [record {:keys [normalizer-url] :as opts}]
-  (let [spdi (get record "canonical_spdi")
-        resp (http-get (str normalizer-url "/translate_from")
-                       {"variation" spdi
-                        "fmt" "spdi"})
-        {errors :errors body :body} (validate-response resp)]
-    (if (seq errors)
-      (add-errors record errors)
-      (get-in body ["variation"]))))
+  (let [spdi (get record "canonical_spdi")]
+    (if-not (opts :use-vrs-python)
+      (let [resp (http-get (str normalizer-url "/to_canonical_variation")
+                           {"q" spdi
+                            "fmt" "spdi"})
+            {errors :errors body :body} (validate-response resp)]
+        (if (seq errors)
+          (add-errors record errors)
+          (get-in body ["canonical_variation" "canonical_context"])))
+      (try
+        (vrs-python/from_spdi spdi)
+        (catch Exception e
+          (add-errors record (.getMessage e)))))))
 
 (defn normalize-copy-number-count
   "Normalize a copy number count record (ClinVar variant name ends in x[0-9]+)"
@@ -209,17 +218,23 @@
   "Normalize hgvs that doesn't meet prior clauses, using /to_vrs endpoint.
    May consider switching to /translate_from."
   [record {:keys [normalizer-url] :as opts}]
-  (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])
-        resp (http-get (str normalizer-url "/to_vrs")
-                       {"q" hgvs-nucleotide})
-        {errors :errors body :body} (validate-response resp)]
-    (if (seq errors)
-      (add-errors record errors)
-      (do (when (not= 1 (count (get body "variations")))
-            (log/error :msg "to_vrs did not return exactly 1 variation"
-                       :hgvs-nucleotide hgvs-nucleotide
-                       :resp-body body))
-          (-> body (get "variations") first)))))
+  (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])]
+    (if-not (opts :use-vrs-python)
+      (let [resp (http-get (str normalizer-url "/to_vrs")
+                           {"q" hgvs-nucleotide})
+            {errors :errors body :body} (validate-response resp)]
+           (if (seq errors)
+             (add-errors record errors)
+             (do (when (not= 1 (count (get body "variations")))
+                   (log/error :msg "to_vrs did not return exactly 1 variation"
+                              :hgvs-nucleotide hgvs-nucleotide
+                              :resp-body body))
+                 (-> body (get "variations") first)))))
+    (try
+      (vrs-python/from_hgvs hgvs-nucleotide)
+      (catch Exception e
+        (add-errors record (.getMessage e))))))
+  
 
 (defn normalize-text [record]
   (let [id (get record "id")]
@@ -458,3 +473,28 @@
                         (with-open [writer (io/writer "run-time.txt")]
                           (.write writer (str millis " ms"))))))))
   (.start t))
+
+(defn annotate-with-extra-fields [{:strs [id name] :as record} vrs]
+  (assoc vrs :_id id :label name))
+
+(defn localrun []
+  "Run in a local testing environment on the main thread"
+  (let [args [:filename "2023-08-19_vcep_vi.json"
+              :normalizer-url "http://localhost:8002/variation"
+              :limit 10
+              :use-vrs-python true]
+        argm (parse-args args)]
+    (when (argm :use-vrs-python)
+      (vrs-python/initialize))
+    (with-open [reader (io/reader (:filename argm))
+                writer (io/writer (str "output-" (:filename argm)))]
+      (doseq [in (->> (line-seq reader)
+                      (map json/parse-string)
+                      (filter #(= "Canonical SPDI" (get-in % ["vrs_xform_plan" "policy"]))))]
+        (let [out (->> (normalize-record in argm)
+                       (annotate-with-extra-fields in))]
+          #_(println (json/generate-string {:in in :out out} {:pretty true}))
+          #_(.write writer (json/generate-string {:in in :out out}))
+          (.write writer (json/generate-string out))
+          (.write writer "\n"))))))
+
