@@ -23,17 +23,21 @@
    :main-opts ["-e" "(do  (require 'clinvar-gk-pilot.main))"
                "-m" "nrepl.cmdline"
                "--port" "6000"
-               "--middleware" "[cider.nrepl/cider-middleware]"]}}
+               "--middleware" "[cider.nrepl/cider-middleware]"]}
 
- :repl-client
- {:extra-deps {cider/cider-nrepl {:mvn/version,"0.28.5"}
-               io.github.clojure/tools.build {:tag "v0.8.4"
-                                              :sha "8c3cd69"}}
-  :jvm-opts ["-Xmx256m"]
-  :main-opts ["-m" "nrepl.cmdline"
-              "--connect"
-              "--port" "6000"
-              "--middleware" "[cider.nrepl/cider-middleware]"]}
+  :lib-python
+  {:jvm-opts ["-Xmx256m" "--add-modules" "jdk.incubator.foreign,jdk.incubator.vector"
+              "--enable-native-access=ALL-UNNAMED"]}
+
+  :repl-client
+  {:extra-deps {cider/cider-nrepl {:mvn/version,"0.28.5"}
+                io.github.clojure/tools.build {:tag "v0.8.4"
+                                               :sha "8c3cd69"}}
+   :jvm-opts ["-Xmx256m"]
+   :main-opts ["-m" "nrepl.cmdline"
+               "--connect"
+               "--port" "6000"
+               "--middleware" "[cider.nrepl/cider-middleware]"]}}
 
  :deps
  {org.clojure/clojure {:mvn/version "1.11.1"}
@@ -53,4 +57,5 @@
   djblue/portal  {:mvn/version "0.23.0"}
   org.rocksdb/rocksdbjni {:mvn/version "8.1.1.1"}
   mount/mount  {:mvn/version "0.1.16"}
-  org.clj-commons/claypoole {:mvn/version "1.2.2"}}}
+  org.clj-commons/claypoole {:mvn/version "1.2.2"}
+  clj-python/libpython-clj {:mvn/version "2.024"}}}
