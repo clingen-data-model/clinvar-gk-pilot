@@ -517,3 +517,29 @@
           #_(.write writer (json/generate-string {:in in :out out}))
           (.write writer (json/generate-string out))
           (.write writer "\n"))))))
+
+
+(comment
+  "clinvar-id 0 value"
+  (let [#_#_input-filename "output-vi.2023-08-19.vcep.json"
+        input-filename "output-variation_identity-all-liftover.ndjson"]
+    (with-open [rdr (io/reader input-filename)
+                wtr (io/writer (str "tabular-" input-filename))]
+      (doseq [line (line-seq rdr)]
+        (let [j (charred/read-json line)
+              variation-id (get-in j ["in" "id"])]
+          (.write wtr (str/join "\t" [variation-id "0" (get j "out")]))
+          (.write wtr "\n")))))
+  (prn "DONE")
+
+  "0 clinvar-id value"
+  (let [#_#_input-filename "output-vi.2023-08-19.vcep.json"
+        input-filename "output-variation_identity-all-liftover.ndjson"]
+    (with-open [rdr (io/reader input-filename)
+                wtr (io/writer (str "tabular-" input-filename))]
+      (doseq [line (line-seq rdr)]
+        (let [j (charred/read-json line)
+              variation-id (get-in j ["in" "id"])]
+          (.write wtr (str/join "\t" ["0" variation-id (get j "out")]))
+          (.write wtr "\n")))))
+  (prn "DONE"))
