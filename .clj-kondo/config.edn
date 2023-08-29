@@ -8,4 +8,5 @@
              (genegraph.database.query/declare-query)]}}
  :lint-as {mount.core/defstate clojure.core/def
            genegraph.source.graphql.common.cache/defresolver clojure.core/defn
-           com.climate.claypoole/with-shutdown! clojure.core/let}}
+           com.climate.claypoole/with-shutdown! clojure.core/let
+           libpython-clj2.require/require-python clojure.core/require}}

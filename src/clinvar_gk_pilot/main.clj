@@ -3,6 +3,7 @@
             [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.spec.alpha :as spec]
+            [clojure.string :as str]
             [com.climate.claypoole :as cp]
             [hato.client :as http]
             [taoensso.timbre :as log]
@@ -31,6 +32,7 @@
 (defn get-http-client
   "Returns http clients from the pool round-robin"
   []
+  #_(first http-client-pool)
   (let [idx (swap! http-client-pool-pointer
                    (fn [v] (let [newv (inc v)]
                              ;; check overflow
@@ -134,7 +136,8 @@
       (let [hgvs-expr (or hgvs-nucleotide seq-derived-hgvs)
             resp (http-get (str normalizer-url "/hgvs_to_copy_number_count")
                            {"hgvs_expr" hgvs-expr
-                            "baseline_copies" absolute-copies})
+                            "baseline_copies" absolute-copies
+                            "do_liftover" true})
             {errors :errors body :body} (validate-response resp)]
         (if (seq errors)
           (add-errors record errors)
@@ -208,7 +211,8 @@
         hgvs-expr (or hgvs-nucleotide derived-hgvs) ;; "NC_000010.11:g.110589642dup"
         resp (http-get (str normalizer-url "/hgvs_to_copy_number_change")
                        {"hgvs_expr" hgvs-expr
-                        "copy_change" efo-copy-class})
+                        "copy_change" efo-copy-class
+                        "do_liftover" true})
         {errors :errors body :body} (validate-response resp)]
     (if (seq errors)
       (add-errors record errors)
@@ -220,21 +224,21 @@
   [record {:keys [normalizer-url] :as opts}]
   (let [hgvs-nucleotide (get-in record ["hgvs" "nucleotide"])]
     (if-not (opts :use-vrs-python)
-      (let [resp (http-get (str normalizer-url "/to_vrs")
+      (let [resp (http-get (str normalizer-url "/normalize")
                            {"q" hgvs-nucleotide})
             {errors :errors body :body} (validate-response resp)]
-           (if (seq errors)
-             (add-errors record errors)
-             (do (when (not= 1 (count (get body "variations")))
-                   (log/error :msg "to_vrs did not return exactly 1 variation"
-                              :hgvs-nucleotide hgvs-nucleotide
-                              :resp-body body))
-                 (-> body (get "variations") first)))))
-    (try
-      (vrs-python/from_hgvs hgvs-nucleotide)
-      (catch Exception e
-        (add-errors record (.getMessage e))))))
-  
+        (if (seq errors)
+          (add-errors record errors)
+          (let [v (-> body (get "variation_descriptor") (get "variation"))]
+            (when (nil? v)
+              (log/error :msg "normalize did not return a variation"
+                         :hgvs-nucleotide hgvs-nucleotide
+                         :resp-body body))
+            v)))
+      (try
+        (vrs-python/from_hgvs hgvs-nucleotide)
+        (catch Exception e
+          (add-errors record (.getMessage e)))))))
 
 (defn normalize-text [record]
   (let [id (get record "id")]
@@ -436,6 +440,7 @@
                   writer (io/writer (str "output-" (:filename args)))]
         (doseq [[in out] (cp/upmap
                           threadpool
+                          ;;map
                           #(do (log/info :msg "Calling normalize-record" :id (get % "id"))
                                (let [out (try [% (normalize-record % args)]
                                               (catch Exception e
@@ -444,12 +449,11 @@
                                                            :options args
                                                            :exception e)
                                                 [% nil]))]
-                                 (log/info :msg "Finished normalize-record" :id (get % "id"))
                                  out))
                           (->> (line-seq reader)
                                (map json/parse-string)
-                               #_(take (or (-> args :limit) Long/MAX_VALUE))))]
-          (log/info :msg "Writing output" :id (get in "id"))
+                               (take (or (-> args :limit) Long/MAX_VALUE))))]
+          (log/info :msg "Writing output" #_#_:idx idx :id (get in "id"))
           (.write writer (json/generate-string {:in in :out out}))
           (.write writer "\n"))))))
 
@@ -464,7 +468,23 @@
   (def t (Thread. (fn []
                     (let [start (Instant/now)]
                       (-main :filename "variation_identity.ndjson"
-                             #_#_:normalizer-url "http://localhost:8100/variation"
+                             #_#_:normalizer-url "http://localhost:8002/variation"
+                             #_#_:limit 1e5)
+                      (let [stop (Instant/now)
+                            duration (Duration/between start stop)
+                            millis (.toMillis duration)]
+                        (log/info :msg "Finished run" :millis millis)
+                        (with-open [writer (io/writer "run-time.txt")]
+                          (.write writer (str millis " ms"))))))))
+  (.start t))
+
+
+(comment
+  "Main run through whole file in separate thread"
+  (def t (Thread. (fn []
+                    (let [start (Instant/now)]
+                      (-main :filename "vi.2023-08-19.vcep.json"
+                             :normalizer-url "http://localhost:8002/variation"
                              #_#_:limit 100000)
                       (let [stop (Instant/now)
                             duration (Duration/between start stop)
@@ -497,4 +517,3 @@
           #_(.write writer (json/generate-string {:in in :out out}))
           (.write writer (json/generate-string out))
           (.write writer "\n"))))))
-
