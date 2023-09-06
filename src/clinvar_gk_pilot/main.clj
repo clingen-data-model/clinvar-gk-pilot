@@ -101,19 +101,17 @@
 (defn normalize-spdi
   "Returns normalized form of variant.
 
-   If return value has some :errors, it didn't work
-
-   TODO: will be switching from /to_canonical_variation to /translate_from when API is updated."
+   If return value has some :errors, it didn't work"
   [record {:keys [normalizer-url] :as opts}]
   (let [spdi (get record "canonical_spdi")]
     (if-not (opts :use-vrs-python)
-      (let [resp (http-get (str normalizer-url "/to_canonical_variation")
-                           {"q" spdi
+      (let [resp (http-get (str normalizer-url "/translate_from")
+                           {"variation" spdi
                             "fmt" "spdi"})
             {errors :errors body :body} (validate-response resp)]
         (if (seq errors)
           (add-errors record errors)
-          (get-in body ["canonical_variation" "canonical_context"])))
+          (get-in body ["variation"])))
       (try
         (vrs-python/from_spdi spdi)
         (catch Exception e
