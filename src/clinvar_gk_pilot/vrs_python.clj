@@ -4,7 +4,7 @@
 
 (require-python '[ga4gh.core :as core :refer [ga4gh_identify ga4gh_digest ga4gh_serialize]])
 (require-python '[ga4gh.vrs :as vrs :refer [models normalize]])
-(require-python '[ga4gh.vrs.extras.translator :as translator :refer [Translator]])
+(require-python '[ga4gh.vrs.extras.translator :as translator :refer [AlleleTranslator]])
 (require-python '[ga4gh.vrs.dataproxy :refer [SeqRepoDataProxy]])
 (require-python '[biocommons.seqrepo :refer [SeqRepo]])
 
@@ -13,7 +13,7 @@
                     SeqRepo
                     SeqRepoDataProxy))
 
-(def tlr (Translator data-proxy {}))
+(def tlr (AlleleTranslator data-proxy {})) 
 
 (defn initialize []
   (py/initialize!))

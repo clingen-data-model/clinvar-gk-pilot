@@ -1,5 +1,6 @@
 .cpcache/
 classes/
-venv/
+venv*/
+.idea/
 .nrepl-port
 
